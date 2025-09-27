@@ -1,0 +1,13 @@
+# 忽略所有日誌檔
+*.log
+
+# 忽略 Python 的快取資料夾
+__pycache__/
+
+# 忽略模型的資料夾
+models/
+
+decode_results/
+lightning_logs/
+not_done_yet/
+slurm/
