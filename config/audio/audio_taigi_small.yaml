@@ -1,0 +1,34 @@
+train_name: whisper
+audio_max_length: 160000  # 10 sec
+text_max_length: null
+accelerator: auto
+weight_decay: 0.01
+adam_epsilon: 1.0e-8
+num_worker: 16
+validate_every_n_batches: 1000
+num_devices: 1
+precision: 16-mixed
+
+model_name: small
+learning_rate: 1.25e-5  # small
+batch_size: 4
+num_train_steps: 80000
+warmup_steps: 8000
+gradient_accumulation_steps: 1
+
+monitor: 'val/cer'
+noise_prob: 0.0  
+
+spec_augment: "" 
+dropout_rate: 0
+
+lang: zh
+resume_training: false
+
+# pt_ckpt: ''
+pt_ckpt: 'whisper_taigi_small/step-78000-cer=0.1811-wer=0.6140.ckpt'
+train_id: whisper_taigi_small
+
+log_output_dir: "slurm/train_audio_slurm"
+check_output_dir: "models/checkpoints"
+filename: "step-{step:05d}-cer={val/cer:.4f}"

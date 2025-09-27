@@ -1,0 +1,44 @@
+train_name: whisper
+audio_max_length: 160000 # 10 sec
+text_max_length: null
+accelerator: auto
+weight_decay: 0.01
+adam_epsilon: 1.0e-8
+num_worker: 16
+validate_every_n_batches: 1000
+num_devices: 1
+precision: 16-mixed
+
+model_name: small
+learning_rate: 5.0e-5
+batch_size: 8
+num_train_steps: 180000
+warmup_steps: 30000
+gradient_accumulation_steps: 1
+
+monitor: 'val/cer_student'  
+noise_prob: 0.0
+noise_snr_train: 0
+
+spec_augment: ""
+dropout_rate: 0 
+
+lang: zh
+resume_training: False
+# pt_ckpt: 'whisper_taigi_small/step-78000-cer=0.1811-wer=0.6140.ckpt'
+# pt_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
+train_id: hermes_asr_taigi
+
+transasr_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
+kd_alpha: 1.0
+kd_beta: 0.5
+kd_gamma: 0.5
+kd_temp: 2.0
+
+# text
+add_gated_x_attn: 1 # 0 for False, 1 for True
+num_langs: 1
+
+log_output_dir: "slurm/train_text_slurm"
+check_output_dir: "models/checkpoints"
+filename: "step-{step:05d}-cer_student={val/cer_student:.4f}"
