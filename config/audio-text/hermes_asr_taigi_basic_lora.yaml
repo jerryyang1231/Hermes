@@ -10,8 +10,10 @@ num_devices: 1
 precision: 16-mixed
 
 model_name: small
-learning_rate: 5.0e-5
-batch_size: 8
+# learning_rate: 5.0e-5
+learning_rate_teacher: 5.0e-5
+learning_rate_student: 2.5e-5
+batch_size: 16
 num_train_steps: 180000
 warmup_steps: 30000
 gradient_accumulation_steps: 1
@@ -27,14 +29,14 @@ lang: zh
 resume_training: False
 # pt_ckpt: 'whisper_taigi_small/step-78000-cer=0.1811-wer=0.6140.ckpt'
 # pt_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
-train_id: hermes_asr_taigi
-# LREC_2026/Hermes/models/checkpoints/hermes_asr_taigi_add_adapters_282_all_hiddens/step-17000-cer_student=0.1839.ckpt
-transasr_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
-student_ckpt: 'hermes_asr_taigi_add_adapters_282_all_hiddens/step-17000-cer_student=0.1839.ckpt'
+train_id: hermes_asr_taigi_basic_lora
+
+# transasr_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
+base_whisper_ckpt: 'models/checkpoints/whisper_taigi_small/step-78000-cer=0.1811-wer=0.6140.ckpt'
 kd_alpha: 1.0
 kd_beta: 0.5
-kd_gamma: 0.5
 kd_temp: 2.0
+kd_delta: 1.0
 
 # text
 add_gated_x_attn: 1 # 0 for False, 1 for True

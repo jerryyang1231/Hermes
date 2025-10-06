@@ -33,7 +33,7 @@ from dataset import YTTDTaigiTRSDataset
 # os.environ['WANDB_DIR'] = 'wandb/'
 
 """
-CUDA_VISIBLE_DEVICES=0 python -u hermes_asr_taigi_add_adapters.py config/audio-text/hermes_asr_taigi_add_adapters.yaml
+CUDA_VISIBLE_DEVICES=2 python -u hermes_asr_taigi_basic_freeze_teacher.py config/audio-text/hermes_asr_taigi_basic_freeze_teacher.yaml
 """
 
 SAMPLE_RATE = 16000
@@ -85,15 +85,16 @@ class DistillWhisperModule(LightningModule):
 
         print("Loading student (vanilla) model")
         # student: vanilla whisper decoder (no gated x-attn)
-        self.student = whisper.load_model(model_name,
-                                        device='cpu',
-                                        download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
-                                        dropout_rate=cfg.dropout_rate,
-                                        add_gated_x_attn=0,  # no gated x-attn for student
-                                        num_langs = cfg.num_langs,
-                                        add_adapter = True,
-                                        adapter_dim = 256, 
-                                        )
+        self.student = whisper.load_model(
+            model_name,
+            device='cpu',
+            download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
+            dropout_rate=cfg.dropout_rate,
+            add_gated_x_attn=0,  # no gated x-attn for student
+            num_langs = cfg.num_langs,
+            # add_adapter = True,
+            # adapter_dim = 256,
+        )
 
         # initialize student with overlapping weights from teacher where shapes match
         print("Copying overlapping weights from teacher -> student where possible")
@@ -130,11 +131,10 @@ class DistillWhisperModule(LightningModule):
         # kd hyperparameters (from cfg or default)
         self.kd_alpha = getattr(cfg, 'kd_alpha', 1.0)   # weight for CE_student
         self.kd_beta  = getattr(cfg, 'kd_beta', 0.5)    # weight for KL distillation
-        self.kd_gamma = getattr(cfg, 'kd_gamma', 0.5)   # weight for logits MSE
         self.kd_temp  = getattr(cfg, 'kd_temp', 2.0)    # temperature for KD
 
         # log config for debugging
-        print("KD config:", {"alpha": self.kd_alpha, "beta": self.kd_beta, "gamma": self.kd_gamma, "temp": self.kd_temp})
+        print("KD config:", {"alpha": self.kd_alpha, "beta": self.kd_beta, "temp": self.kd_temp})
         # Note: we intentionally do NOT move modules to device here; Lightning will handle it.
 
     def forward(self, x):
@@ -148,31 +148,29 @@ class DistillWhisperModule(LightningModule):
         translations = batch["translations"]    # list[str]
         device = input_ids.device
 
-        # 1) teacher: get xt from BERT (no grad)
-        bert_inputs = self.bert_tokenizer(
-            translations,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=448,
-        ).to(device)
+        bert_inputs = self.bert_tokenizer(translations,
+                                        return_tensors='pt',
+                                        padding=True,
+                                        truncation=True,
+                                        max_length=448,
+                                        ).to(device)
         with torch.no_grad():
             bert_outputs = self.bert_model(**bert_inputs)
             xt = bert_outputs.last_hidden_state  # [B, seq_len, hidden_size]
 
-        # 2) encoder features (teacher & student)
+        # teacher forward
         with torch.no_grad():
             audio_feat_teacher = self.teacher.encoder(input_ids)
-            # teacher decoder forward (no grad)
-            teacher_adapter_outputs, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_adapter_out=True)
+            teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt])
             # teacher_logits: [B, T_dec, V]
-        # student forward (trainable)
+
+        # student forward
         audio_feat_student = self.student.encoder(input_ids)
-        student_adapter_outputs, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_adapter_out=True)  # [B, T_dec, V]
+        student_logits = self.student.decoder(dec_input_ids, audio_feat_student)  # [B, T_dec, V]
 
         V = student_logits.size(-1)
 
-        # CE loss on student (use standard cross entropy)
+        # student CE loss
         ce = self.ce_loss(student_logits.view(-1, V), labels.view(-1))
 
         # prepare flattened masked selections where labels != -100
@@ -186,49 +184,12 @@ class DistillWhisperModule(LightningModule):
         q = F.softmax(t_flat / tau, dim=-1)
         kd = self.kl_loss(log_p, q) * (tau ** 2)
 
-        # labels mask: 只在 labels != -100 的 decoder 預測位置計算 rep
-        # labels shape: [B, L_dec]
-        mask_positions = (labels != -100)  # bool [B, L_dec]
-        # flatten mask to [B * L_dec]
-        mask_flat = mask_positions.view(-1)  # torch.bool
-
-        rep_loss = 0.0
-        eps = 1e-8
-        for s_features, t_features in zip(student_adapter_outputs, teacher_adapter_outputs):
-
-            s_tensor = s_features['adapter']
-            t_tensor = t_features['gated_x_attn']
-
-            # flatten valid positions: [N_kept, D]
-            s_flat = s_tensor.contiguous().view(-1, s_tensor .size(-1))[mask_flat]
-            t_flat = t_tensor.contiguous().view(-1, t_tensor.size(-1)).detach()[mask_flat]
-
-            if s_flat.shape[0] == 0:
-                continue
-
-            # cast to float32 for stability (especially fp16 training)
-            s_flat_f = s_flat.float()
-            t_flat_f = t_flat.float()
-
-            # cosine per-vector
-            cos_sim = F.cosine_similarity(s_flat_f, t_flat_f, dim=-1)  # [N_kept]
-            layer_loss = (1.0 - cos_sim).mean()
-            rep_loss += layer_loss
-
-        L = len(teacher_adapter_outputs)
-        # average over layers (and handle case L==0)
-        if L > 0:
-            rep_loss = rep_loss / float(L)
-        else:
-            rep_loss = torch.tensor(0.0, device=labels.device)
-
         # total loss
-        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * rep_loss
+        loss = self.kd_alpha * ce + self.kd_beta * kd
 
         # logging
         self.log("train/ce", ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/kd", kd, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/rep", rep_loss, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
 
         return loss

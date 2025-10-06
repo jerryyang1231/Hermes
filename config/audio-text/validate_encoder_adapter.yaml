@@ -27,11 +27,10 @@ lang: zh
 resume_training: False
 # pt_ckpt: 'whisper_taigi_small/step-78000-cer=0.1811-wer=0.6140.ckpt'
 # pt_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
-train_id: hermes_asr_taigi
-# LREC_2026/Hermes/models/checkpoints/hermes_asr_taigi_add_adapters_282_all_hiddens/step-17000-cer_student=0.1839.ckpt
+train_id: validate_encoder_adapter
+# LREC_2026/Hermes/models/checkpoints/hermes_asr_taigi_basic_encoder_adapter/step-54000-cer_student=0.1800.ckpt
 transasr_ckpt: 'trans_asr_taigi/step-176000-cer_at=0.1584.ckpt'
-student_ckpt: 'hermes_asr_taigi_add_adapters_282_all_hiddens/step-17000-cer_student=0.1839.ckpt'
-kd_alpha: 1.0
+student_ckpt: 'hermes_asr_taigi_basic_encoder_adapter/step-54000-cer_student=0.1800.ckpt'
 kd_beta: 0.5
 kd_gamma: 0.5
 kd_temp: 2.0

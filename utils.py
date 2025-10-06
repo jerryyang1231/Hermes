@@ -200,6 +200,47 @@ def whisper_flamingo_optimizer(model, cfg, t_total):
     )
     return optimizer, scheduler
 
+def whisper_adapter_optimizer(model, cfg, t_total):
+    # 要尋找的參數關鍵字
+    adapter_keywords = ["adapter"]
+    
+    # 需要排除 weight decay 的參數
+    no_decay = ["bias", "LayerNorm.weight"]
+    
+    # 將參數分組：adapter 參數（有/無 weight decay）
+    optimizer_grouped_parameters = [
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and any(keyword in n for keyword in adapter_keywords) and not any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": cfg.weight_decay,
+        },
+        {
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and any(keyword in n for keyword in adapter_keywords) and any(nd in n for nd in no_decay)
+            ],
+            "weight_decay": 0.0,
+        },
+    ]
+    
+    # 建立 AdamW 優化器
+    optimizer = AdamW(
+        optimizer_grouped_parameters,
+        lr=cfg.learning_rate,  # 這裡可以考慮為 adapter 設定獨立的學習率
+        eps=cfg.adam_epsilon
+    )
+
+    # 建立學習率排程器
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=cfg.warmup_steps,
+        num_training_steps=t_total
+    )
+    
+    return optimizer, scheduler
+
 def setup_logging_and_checkpoint(log_output_dir, check_output_dir, train_name, train_id, monitor, filename):
     Path(log_output_dir).mkdir(exist_ok=True)
     Path(check_output_dir).mkdir(exist_ok=True)

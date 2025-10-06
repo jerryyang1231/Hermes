@@ -397,11 +397,11 @@ class TextDecoder(nn.Module):
                 all_collected_features.append(collected_features)
 
         # Apply layer normalization
-        x = self.ln(x)
+        x = self.ln(x) # (B, T, D)
 
         last_hidden_states = x
         # Calculate logits
-        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float() # (B, T, V)
 
         if return_hidden:
             return hidden_states, last_hidden_states, logits
@@ -494,6 +494,22 @@ class Whisper(nn.Module):
 
         self.decoder.apply(install_hooks)
         return cache, hooks
+
+    def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        """
+        這是一個為了相容 peft 函式庫而加入的輔助方法。
+        它只簡單地將輸入打包成字典回傳，以滿足 peft 在初始化時的 API 檢查。
+        """
+        # 簡單地將 input_ids 和其他可能的參數打包成字典
+        model_inputs = {"input_ids": input_ids}
+        model_inputs.update(kwargs)
+        return model_inputs
+
+    def _prepare_encoder_decoder_kwargs_for_generation(self, *args, **kwargs):
+        """
+        又一個為了滿足 peft API 檢查而加入的輔助方法。
+        """
+        return kwargs
 
     detect_language = detect_language_function
     transcribe = transcribe_function

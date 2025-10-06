@@ -17,6 +17,7 @@ from utils import (
     whisper_flamingo_collator,
     whisper_optimizer,
     whisper_flamingo_optimizer,
+    whisper_adapter_optimizer,
     setup_logging_and_checkpoint,
     wer_cer,
     DistributedSamplerWrapper,
@@ -29,11 +30,12 @@ from transformers import BertModel, BertTokenizer
 import copy
 import torch.nn.functional as F
 from dataset import YTTDTaigiTRSDataset
-# os.environ["WANDB_MODE"] = "disabled"
-# os.environ['WANDB_DIR'] = 'wandb/'
+from peft import LoraConfig, get_peft_model, TaskType
+os.environ["WANDB_MODE"] = "disabled"
+os.environ['WANDB_DIR'] = 'wandb/'
 
 """
-CUDA_VISIBLE_DEVICES=0 python -u hermes_asr_taigi_add_adapters.py config/audio-text/hermes_asr_taigi_add_adapters.yaml
+CUDA_VISIBLE_DEVICES=2 python -u hermes_asr_taigi_lora_282_all_hiddens.py config/audio-text/hermes_asr_taigi_lora_282_all_hiddens.yaml
 """
 
 SAMPLE_RATE = 16000
@@ -51,7 +53,7 @@ class DistillWhisperModule(LightningModule):
         # load teacher model (with gated x-attn)
         self.teacher = whisper.load_model(model_name,
                                         device='cpu', # avoid OOM on gpu 0 for distributed
-                                        download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
+                                        download_root='models/',
                                         dropout_rate=cfg.dropout_rate,
                                         add_gated_x_attn=cfg.add_gated_x_attn,
                                         num_langs = cfg.num_langs,
@@ -60,7 +62,7 @@ class DistillWhisperModule(LightningModule):
         # load TransASR ckpt weights into teacher if provided
         trans_ckpt = cfg.transasr_ckpt
         if trans_ckpt != '':
-            checkpoint_root = '/share/nas169/jerryyang/LREC_2026/Hermes/models/checkpoints/'
+            checkpoint_root = 'models/checkpoints/'
             ckpt_path = os.path.join(checkpoint_root, cfg.transasr_ckpt) if not os.path.isabs(trans_ckpt) else trans_ckpt
             print("Loading TransASR checkpoint for teacher:", ckpt_path)
             state_dict = torch.load(ckpt_path, map_location='cpu')
@@ -87,12 +89,10 @@ class DistillWhisperModule(LightningModule):
         # student: vanilla whisper decoder (no gated x-attn)
         self.student = whisper.load_model(model_name,
                                         device='cpu',
-                                        download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
+                                        download_root='models/',
                                         dropout_rate=cfg.dropout_rate,
                                         add_gated_x_attn=0,  # no gated x-attn for student
                                         num_langs = cfg.num_langs,
-                                        add_adapter = True,
-                                        adapter_dim = 256, 
                                         )
 
         # initialize student with overlapping weights from teacher where shapes match
@@ -107,9 +107,30 @@ class DistillWhisperModule(LightningModule):
         self.student.load_state_dict(student_state_dict, strict=False)
         print(f"Copied {loaded} matching tensors from teacher to student (approx).")
 
-        # freeze student encoder
-        for p in self.student.encoder.parameters():
-            p.requires_grad = False
+        # # freeze student encoder
+        # for p in self.student.encoder.parameters():
+        #     p.requires_grad = False
+
+        # 將 SimpleNamespace 改為字典
+        if not hasattr(self.student, "config"):
+            # 使用一個字典，它天生就支援 .get() 方法
+            self.student.config = {"is_encoder_decoder": True}
+
+        # 定義 LoRA 設定
+        print("Applying LoRA to the Student model...")
+        lora_config = LoraConfig(
+            r=16,  # LoRA 的秩 (rank)，可以從 8, 16, 32 開始嘗試
+            lora_alpha=32,  # 縮放因子，通常設為 r 的兩倍
+            target_modules=["query", "key", "value"], # 針對 Whisper 的 Attention 層中的 query, key 和 value 進行注入
+            lora_dropout=0.05,
+            task_type=TaskType.SEQ_2_SEQ_LM # 告訴 peft 這是一個序列到序列的模型
+        )
+
+        # 用 peft 將 student 模型包裝成 PeftModel
+        self.student = get_peft_model(self.student, lora_config)
+
+        # 打印出可訓練參數的比例，這是一個非常有用的驗證步驟！
+        self.student.print_trainable_parameters()
 
         # tokenizer, normalizer, bert (teacher uses bert to get xt)
         self.tokenizer = whisper.tokenizer.get_tokenizer(multilingual=True, language=lang, task='transcribe')
@@ -128,10 +149,10 @@ class DistillWhisperModule(LightningModule):
         self.kl_loss = nn.KLDivLoss(reduction='batchmean')  # expects log-probs input
 
         # kd hyperparameters (from cfg or default)
-        self.kd_alpha = getattr(cfg, 'kd_alpha', 1.0)   # weight for CE_student
-        self.kd_beta  = getattr(cfg, 'kd_beta', 0.5)    # weight for KL distillation
-        self.kd_gamma = getattr(cfg, 'kd_gamma', 0.5)   # weight for logits MSE
-        self.kd_temp  = getattr(cfg, 'kd_temp', 2.0)    # temperature for KD
+        self.kd_alpha = getattr(cfg, 'kd_alpha', 0.2)   # weight for CE_student
+        self.kd_beta  = getattr(cfg, 'kd_beta', 0.8)    # weight for KL distillation
+        self.kd_gamma = getattr(cfg, 'kd_gamma', 0.2)   # weight for feat cos_sim
+        self.kd_temp  = getattr(cfg, 'kd_temp', 0.2)    # temperature for KD
 
         # log config for debugging
         print("KD config:", {"alpha": self.kd_alpha, "beta": self.kd_beta, "gamma": self.kd_gamma, "temp": self.kd_temp})
@@ -148,88 +169,68 @@ class DistillWhisperModule(LightningModule):
         translations = batch["translations"]    # list[str]
         device = input_ids.device
 
-        # 1) teacher: get xt from BERT (no grad)
-        bert_inputs = self.bert_tokenizer(
-            translations,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=448,
-        ).to(device)
+        bert_inputs = self.bert_tokenizer(translations,
+                                        return_tensors='pt',
+                                        padding=True,
+                                        truncation=True,
+                                        max_length=448,
+                                        ).to(device)
         with torch.no_grad():
             bert_outputs = self.bert_model(**bert_inputs)
             xt = bert_outputs.last_hidden_state  # [B, seq_len, hidden_size]
 
-        # 2) encoder features (teacher & student)
+        # teacher forward
         with torch.no_grad():
             audio_feat_teacher = self.teacher.encoder(input_ids)
-            # teacher decoder forward (no grad)
-            teacher_adapter_outputs, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_adapter_out=True)
-            # teacher_logits: [B, T_dec, V]
-        # student forward (trainable)
-        audio_feat_student = self.student.encoder(input_ids)
-        student_adapter_outputs, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_adapter_out=True)  # [B, T_dec, V]
+            teacher_hiddens, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_hidden=True)  # [B, T_dec, V]
+        # student forward
+        with torch.no_grad():
+            audio_feat_student = self.student.encoder(input_ids)
+        student_hiddens, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_hidden=True)  # [B, T_dec, V]
 
         V = student_logits.size(-1)
 
-        # CE loss on student (use standard cross entropy)
+        # student CE loss
         ce = self.ce_loss(student_logits.view(-1, V), labels.view(-1))
 
-        # prepare flattened masked selections where labels != -100
+        # KD loss
         mask = (labels.view(-1) != -100)
         s_flat = student_logits.view(-1, V)[mask]  # [Nkept, V]
         t_flat = teacher_logits.view(-1, V).detach()[mask]  # detach teacher
-
-        # KD loss (KLDiv between softened distributions)
         tau = float(self.kd_temp)
         log_p = F.log_softmax(s_flat / tau, dim=-1)
         q = F.softmax(t_flat / tau, dim=-1)
         kd = self.kl_loss(log_p, q) * (tau ** 2)
 
-        # labels mask: 只在 labels != -100 的 decoder 預測位置計算 rep
-        # labels shape: [B, L_dec]
-        mask_positions = (labels != -100)  # bool [B, L_dec]
-        # flatten mask to [B * L_dec]
-        mask_flat = mask_positions.view(-1)  # torch.bool
+        # feat loss
+        feat_loss = torch.tensor(0.0, device=labels.device)
+        D = student_final.size(-1)
 
-        rep_loss = 0.0
-        eps = 1e-8
-        for s_features, t_features in zip(student_adapter_outputs, teacher_adapter_outputs):
+        for s_hid, t_hid in zip(student_hiddens, teacher_hiddens):
+            # 1. 將 hidden state 拉平 (flatten)
+            s_hid_flat = s_hid.view(-1, D)
+            t_hid_flat = t_hid.view(-1, D).detach()
 
-            s_tensor = s_features['adapter']
-            t_tensor = t_features['gated_x_attn']
+            # 2. 套用和 logits 同樣的 mask，只選取有效 token 的 hidden state
+            s_hid_masked = s_hid_flat[mask]
+            t_hid_masked = t_hid_flat[mask]
 
-            # flatten valid positions: [N_kept, D]
-            s_flat = s_tensor.contiguous().view(-1, s_tensor .size(-1))[mask_flat]
-            t_flat = t_tensor.contiguous().view(-1, t_tensor.size(-1)).detach()[mask_flat]
+            # 3. 在篩選過的 hidden state 上計算 loss
+            cos_sim = F.cosine_similarity(s_hid_masked, t_hid_masked, dim=-1)
+            feat_loss += (1 - cos_sim).mean()
 
-            if s_flat.shape[0] == 0:
-                continue
-
-            # cast to float32 for stability (especially fp16 training)
-            s_flat_f = s_flat.float()
-            t_flat_f = t_flat.float()
-
-            # cosine per-vector
-            cos_sim = F.cosine_similarity(s_flat_f, t_flat_f, dim=-1)  # [N_kept]
-            layer_loss = (1.0 - cos_sim).mean()
-            rep_loss += layer_loss
-
-        L = len(teacher_adapter_outputs)
-        # average over layers (and handle case L==0)
-        if L > 0:
-            rep_loss = rep_loss / float(L)
-        else:
-            rep_loss = torch.tensor(0.0, device=labels.device)
+        # 確保列表不為空，避免除以零的錯誤
+        if len(student_hiddens) > 0:
+            feat_loss = feat_loss / len(student_hiddens)
 
         # total loss
-        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * rep_loss
+        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * feat_loss
 
         # logging
-        self.log("train/ce", ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/kd", kd, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/rep", rep_loss, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("train/ce_loss", ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/kd_loss", kd, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/feat_loss", feat_loss, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/total_loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
 
         return loss
 
@@ -357,12 +358,12 @@ class DistillWhisperModule(LightningModule):
                                     noise_prob=0,
                                     lang=cfg.lang,
                                     )
-        batch_sampler = SortedBatchSampler(
-                    batch_size = self.cfg.batch_size,
-                    shapes=[(item['wav_lens']) for item in dataset],
-                    sort_in_batch='descending',
-                    sort_batch='descending',
-                    drop_last=False)
+        batch_sampler = SortedBatchSampler(batch_size = self.cfg.batch_size,
+                                            shapes=[(item['wav_lens']) for item in dataset],
+                                            sort_in_batch='descending',
+                                            sort_batch='descending',
+                                            drop_last=False
+                                            )
         return torch.utils.data.DataLoader(dataset,
                           batch_sampler=batch_sampler,
                           num_workers=self.cfg.num_worker,

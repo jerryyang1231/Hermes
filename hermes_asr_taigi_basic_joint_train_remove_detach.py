@@ -28,27 +28,113 @@ from whisper.normalizers.basic import BasicTextNormalizer
 from transformers import BertModel, BertTokenizer
 import copy
 import torch.nn.functional as F
-from dataset import YTTDTaigiTRSDataset
 # os.environ["WANDB_MODE"] = "disabled"
 # os.environ['WANDB_DIR'] = 'wandb/'
 
 """
-CUDA_VISIBLE_DEVICES=0 python -u hermes_asr_taigi_add_adapters.py config/audio-text/hermes_asr_taigi_add_adapters.yaml
+CUDA_VISIBLE_DEVICES=2 python -u hermes_asr_taigi_basic_joint_train_remove_detach.py config/audio-text/hermes_asr_taigi_basic_joint_train_remove_detach.yaml
 """
 
 SAMPLE_RATE = 16000
 SEED = 3407
 seed_everything(SEED, workers=True)
 
+# valid_set_list 包含的前11字符的ID
+valid_set_list = ['-d8TlAGYFmc', '3h8m__iwuJ4', '5mPJOkoIu3k', '87omMWX-DTw',
+                'E0-HOPE7_QU', 'EhqcvfaaYu8', 'gDDbnFcvWcQ', 'iy1fPQQSA6c',
+                'kGbjIuzvPR8', 'MrwSzSVGiRE', 'yht8d59dCpo']
+
+class YTTDTaigiTRSDataset(Dataset):
+    def __init__(self, split, tokenizer, sample_rate, model_name, max_length, 
+                spec_augment, noise_prob=0, noise_fn=None) -> None:
+        super().__init__()
+        
+        if split == 'train':
+            dataset = load_dataset("formospeech/yttd_taigi_trs", name='train', split='train')
+            self.dataset = dataset.filter(lambda sample: sample['id'][:11] not in valid_set_list)
+            print(f"train set size: {len(self.dataset)}")
+        elif split == 'val':
+            dataset = load_dataset("formospeech/yttd_taigi_trs", name='train', split='train')
+            self.dataset = dataset.filter(lambda sample: sample['id'][:11] in valid_set_list)
+            print(f"valid set size: {len(self.dataset)}")
+        else:  # 'test'
+            self.dataset = load_dataset("formospeech/yttd_taigi_trs", name='test', split='train')
+            print(f"test set size: {len(self.dataset)}")
+
+        self.sample_rate = sample_rate
+        self.tokenizer = tokenizer
+        self.model_name = model_name
+        self.max_length = max_length
+
+        self.spec_augment = spec_augment
+        self.noise_prob = noise_prob
+        self.noise_fn = [ln.strip() for ln in open(noise_fn).readlines()] if noise_fn is not None else []
+        self.text_normalizer = BasicTextNormalizer(remove_diacritics=True, split_letters=False)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, id):
+        lang = cfg.lang
+        item = self.dataset[id]
+
+        wav_data = item['audio']['array']
+        wav_lens = len(wav_data)
+        text = item['text']
+        mandarin_text = item['text_mandarin']
+
+        text = self.text_normalizer(text).replace(" ", "")
+        mandarin_text = self.text_normalizer(mandarin_text).replace(" ", "")
+
+        if np.random.rand() > self.noise_prob: 
+            audio = wav_data.flatten().astype(np.float32)
+        else:
+            audio = add_noise(wav_data, self.noise_fn, noise_snr=0).flatten().astype(np.float32)
+        
+        audio_frames = len(audio.flatten()) // 160
+        if self.max_length is not None:
+            audio = whisper.pad_or_trim(audio.flatten(), length=self.max_length)
+            
+        n_mels = 80 if self.model_name != 'large-v3' else 128
+        mel = whisper.log_mel_spectrogram(audio, n_mels=n_mels)
+
+        if self.spec_augment:
+            if self.spec_augment == "ls-double":
+                mel = torch.from_numpy(spec_augment(mel.T.numpy(), audio_frames)).T
+            elif self.spec_augment == "ls-basic":
+                mel = torch.from_numpy(spec_augment(mel.T.numpy(), audio_frames, n_freq_mask=1, n_time_mask=1)).T
+            else:
+                raise NotImplementedError 
+
+        dec_input_ids = [self.tokenizer.sot, 
+                        self.tokenizer.special_tokens["<|{}|>".format(lang)],
+                        self.tokenizer.transcribe, 
+                        self.tokenizer.no_timestamps] + \
+                        self.tokenizer.encode(" " + text)
+        labels = dec_input_ids[1:] + [self.tokenizer.eot]
+
+        return {
+            "input_ids": mel,
+            "labels": labels,
+            "dec_input_ids": dec_input_ids,
+            "translations": mandarin_text,
+            "wav_lens": wav_lens
+        }
+
 class DistillWhisperModule(LightningModule):
     def __init__(self, cfg, model_name, lang) -> None:
         super().__init__()
+        self.automatic_optimization = False # <--- 加入這一行，關閉自動優化
         self.cfg = cfg
         self.model_name = model_name
         self.lang = lang
 
-        print("Loading teacher (TransASR) model")
-        # load teacher model (with gated x-attn)
+        # --- 步驟 1: 載入您已經 fine-tune 好的台語 Whisper 模型作為基礎 ---
+        print("Loading base fine-tuned Whisper model...")
+        base_ckpt_path = cfg.base_whisper_ckpt # 您需要在 config 中指定這個路徑
+
+        # 建立 Teacher 和 Student 的「空殼」
+        # Teacher 需要 gated_x_attn 的結構
         self.teacher = whisper.load_model(model_name,
                                         device='cpu', # avoid OOM on gpu 0 for distributed
                                         download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
@@ -56,60 +142,44 @@ class DistillWhisperModule(LightningModule):
                                         add_gated_x_attn=cfg.add_gated_x_attn,
                                         num_langs = cfg.num_langs,
                                         )
-
-        # load TransASR ckpt weights into teacher if provided
-        trans_ckpt = cfg.transasr_ckpt
-        if trans_ckpt != '':
-            checkpoint_root = '/share/nas169/jerryyang/LREC_2026/Hermes/models/checkpoints/'
-            ckpt_path = os.path.join(checkpoint_root, cfg.transasr_ckpt) if not os.path.isabs(trans_ckpt) else trans_ckpt
-            print("Loading TransASR checkpoint for teacher:", ckpt_path)
-            state_dict = torch.load(ckpt_path, map_location='cpu')
-            state_dict = state_dict['state_dict']
-            # remove possible "model." prefix
-            state_dict_updated = {}
-            for k, v in state_dict.items():
-                newk = k
-                if k.startswith('model.'):
-                    newk = k[len('model.'):]
-                state_dict_updated[newk] = v
-            try:
-                self.teacher.load_state_dict(state_dict_updated, strict=False)
-            except Exception as e:
-                print("Teacher load_state_dict error:", e)
-                self.teacher.load_state_dict(state_dict_updated, strict=False)
-
-        # freeze teacher fully
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-
-        print("Loading student (vanilla) model")
-        # student: vanilla whisper decoder (no gated x-attn)
+        # Student 是標準的 Whisper
         self.student = whisper.load_model(model_name,
                                         device='cpu',
                                         download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
                                         dropout_rate=cfg.dropout_rate,
                                         add_gated_x_attn=0,  # no gated x-attn for student
                                         num_langs = cfg.num_langs,
-                                        add_adapter = True,
-                                        adapter_dim = 256, 
                                         )
 
-        # initialize student with overlapping weights from teacher where shapes match
-        print("Copying overlapping weights from teacher -> student where possible")
-        teacher_state_dict = self.teacher.state_dict()
-        student_state_dict = self.student.state_dict()
-        loaded = 0
-        for k, v in teacher_state_dict.items():
-            if k in student_state_dict and student_state_dict[k].shape == v.shape:
-                student_state_dict[k] = v.clone()
-                loaded += 1
-        self.student.load_state_dict(student_state_dict, strict=False)
-        print(f"Copied {loaded} matching tensors from teacher to student (approx).")
+        # 載入基礎權重
+        state_dict = torch.load(base_ckpt_path, map_location='cpu')['state_dict']
+        
+        # 移除 "model." 前綴
+        state_dict_updated = {k.replace('model.', ''): v for k, v in state_dict.items()}
 
-        # freeze student encoder
+        # 將同一份權重載入到 Teacher 和 Student 中
+        # strict=False 允許 Teacher 缺少 gated_x_attn 相關權重
+        self.teacher.load_state_dict(state_dict_updated, strict=False)
+        self.student.load_state_dict(state_dict_updated, strict=False)
+        print("Initialized both Teacher and Student from the same checkpoint.")
+
+        # --- 步驟 2: 精準地設定 Teacher 和 Student 的凍結/解凍狀態 ---
+        # 對於 Teacher: 凍結所有參數，然後只解凍 gated cross-attention 相關層
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        
+        # unnecessary?
+        x_attn_keywords = ["gated_x_attn", "attn_gate", "ff_gate"] # 根據您的 optimizer
+        for n, p in self.teacher.named_parameters():
+            if any(keyword in n for keyword in x_attn_keywords):
+                p.requires_grad = True
+                print(f"Unfreezing Teacher param: {n}")
+
+        # 對於 Student: 凍結 Encoder，解凍 Decoder
         for p in self.student.encoder.parameters():
             p.requires_grad = False
+        for p in self.student.decoder.parameters():
+            p.requires_grad = True
 
         # tokenizer, normalizer, bert (teacher uses bert to get xt)
         self.tokenizer = whisper.tokenizer.get_tokenizer(multilingual=True, language=lang, task='transcribe')
@@ -130,11 +200,11 @@ class DistillWhisperModule(LightningModule):
         # kd hyperparameters (from cfg or default)
         self.kd_alpha = getattr(cfg, 'kd_alpha', 1.0)   # weight for CE_student
         self.kd_beta  = getattr(cfg, 'kd_beta', 0.5)    # weight for KL distillation
-        self.kd_gamma = getattr(cfg, 'kd_gamma', 0.5)   # weight for logits MSE
         self.kd_temp  = getattr(cfg, 'kd_temp', 2.0)    # temperature for KD
+        self.kd_delta = getattr(cfg, 'kd_delta', 1.0)   # weight for CE_teacher
 
         # log config for debugging
-        print("KD config:", {"alpha": self.kd_alpha, "beta": self.kd_beta, "gamma": self.kd_gamma, "temp": self.kd_temp})
+        print("KD config:", {"alpha": self.kd_alpha, "beta": self.kd_beta, "temp": self.kd_temp, "delta": self.kd_delta})
         # Note: we intentionally do NOT move modules to device here; Lightning will handle it.
 
     def forward(self, x):
@@ -142,43 +212,47 @@ class DistillWhisperModule(LightningModule):
         return self.student(x)
 
     def training_step(self, batch, batch_id):
-        input_ids = batch["input_ids"]          # mel [B, n_mels, T]
-        labels = batch["labels"].long()         # [B, L]
-        dec_input_ids = batch["dec_input_ids"].long()  # [B, L_dec]
-        translations = batch["translations"]    # list[str]
+        # --- 1. 取得優化器 (這是手動模式的關鍵步驟) ---
+        opt_teacher, opt_student = self.optimizers()
+
+        # --- 2. 正常計算 forward pass 和 loss (這部分和您原本的程式碼完全一樣) ---
+        input_ids = batch["input_ids"]
+        labels = batch["labels"].long()
+        dec_input_ids = batch["dec_input_ids"].long()
+        translations = batch["translations"]
         device = input_ids.device
 
-        # 1) teacher: get xt from BERT (no grad)
-        bert_inputs = self.bert_tokenizer(
-            translations,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=448,
-        ).to(device)
+        bert_inputs = self.bert_tokenizer(translations,
+                                        return_tensors='pt',
+                                        padding=True,
+                                        truncation=True,
+                                        max_length=448,
+                                    ).to(device)
         with torch.no_grad():
             bert_outputs = self.bert_model(**bert_inputs)
             xt = bert_outputs.last_hidden_state  # [B, seq_len, hidden_size]
 
-        # 2) encoder features (teacher & student)
-        with torch.no_grad():
-            audio_feat_teacher = self.teacher.encoder(input_ids)
-            # teacher decoder forward (no grad)
-            teacher_adapter_outputs, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_adapter_out=True)
-            # teacher_logits: [B, T_dec, V]
-        # student forward (trainable)
+        # teacher forward
+        audio_feat_teacher = self.teacher.encoder(input_ids)
+        teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt])
+        # teacher_logits: [B, T_dec, V]
+
+        # student forward
         audio_feat_student = self.student.encoder(input_ids)
-        student_adapter_outputs, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_adapter_out=True)  # [B, T_dec, V]
+        student_logits = self.student.decoder(dec_input_ids, audio_feat_student)  # [B, T_dec, V]
 
         V = student_logits.size(-1)
 
-        # CE loss on student (use standard cross entropy)
+        # teacher CE loss
+        teacher_ce = self.ce_loss(teacher_logits.view(-1, V), labels.view(-1))
+
+        # student CE loss
         ce = self.ce_loss(student_logits.view(-1, V), labels.view(-1))
 
         # prepare flattened masked selections where labels != -100
         mask = (labels.view(-1) != -100)
         s_flat = student_logits.view(-1, V)[mask]  # [Nkept, V]
-        t_flat = teacher_logits.view(-1, V).detach()[mask]  # detach teacher
+        t_flat = teacher_logits.view(-1, V)[mask]
 
         # KD loss (KLDiv between softened distributions)
         tau = float(self.kd_temp)
@@ -186,52 +260,33 @@ class DistillWhisperModule(LightningModule):
         q = F.softmax(t_flat / tau, dim=-1)
         kd = self.kl_loss(log_p, q) * (tau ** 2)
 
-        # labels mask: 只在 labels != -100 的 decoder 預測位置計算 rep
-        # labels shape: [B, L_dec]
-        mask_positions = (labels != -100)  # bool [B, L_dec]
-        # flatten mask to [B * L_dec]
-        mask_flat = mask_positions.view(-1)  # torch.bool
-
-        rep_loss = 0.0
-        eps = 1e-8
-        for s_features, t_features in zip(student_adapter_outputs, teacher_adapter_outputs):
-
-            s_tensor = s_features['adapter']
-            t_tensor = t_features['gated_x_attn']
-
-            # flatten valid positions: [N_kept, D]
-            s_flat = s_tensor.contiguous().view(-1, s_tensor .size(-1))[mask_flat]
-            t_flat = t_tensor.contiguous().view(-1, t_tensor.size(-1)).detach()[mask_flat]
-
-            if s_flat.shape[0] == 0:
-                continue
-
-            # cast to float32 for stability (especially fp16 training)
-            s_flat_f = s_flat.float()
-            t_flat_f = t_flat.float()
-
-            # cosine per-vector
-            cos_sim = F.cosine_similarity(s_flat_f, t_flat_f, dim=-1)  # [N_kept]
-            layer_loss = (1.0 - cos_sim).mean()
-            rep_loss += layer_loss
-
-        L = len(teacher_adapter_outputs)
-        # average over layers (and handle case L==0)
-        if L > 0:
-            rep_loss = rep_loss / float(L)
-        else:
-            rep_loss = torch.tensor(0.0, device=labels.device)
-
         # total loss
-        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * rep_loss
+        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_delta * teacher_ce
 
-        # logging
+        # --- 3. 手動執行優化步驟 ---
+        # 首先清除兩個優化器的舊梯度
+        opt_teacher.zero_grad()
+        opt_student.zero_grad()
+
+        # 計算梯度 (Lightning 建議使用 self.manual_backward)
+        self.manual_backward(loss)
+
+        # 依序更新兩個優化器的權重
+        opt_teacher.step()
+        opt_student.step()
+
+        # --- 4. 手動更新學習率排程器 (如果有的話) ---
+        sched_teacher, sched_student = self.lr_schedulers()
+        sched_teacher.step()
+        sched_student.step()
+
+        # --- 5. Logging ---
         self.log("train/ce", ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/kd", kd, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/rep", rep_loss, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/teacher_ce", teacher_ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
 
-        return loss
+        # 在手動模式下，training_step 不需要 return 任何東西
 
     def validation_step(self, batch, batch_id, dataloader_idx=None):
         # similar to your original validation but only evaluate student
@@ -291,12 +346,35 @@ class DistillWhisperModule(LightningModule):
         return
 
     def configure_optimizers(self):
-        # Optimize only student parameters (and optionally other trainable parts)
-        params = [p for p in self.student.parameters() if p.requires_grad]
-        # you can choose to include additional modules (like a small adapter) here
-        optimizer, scheduler = whisper_optimizer(self.student, self.cfg, self.t_total)
-        self.optimizer, self.scheduler = optimizer, scheduler
-        return [optimizer], [{"scheduler": scheduler, "interval": "step", "frequency": 1}]
+        # --- 優化器 1: Teacher's Optimizer ---
+        # 使用您提供的 whisper_flamingo_optimizer 邏輯，只訓練 gated_x_attn 相關層
+        print("Setting up Teacher's optimizer...")
+        # 假設您的 config 中有 teacher 專用的學習率
+        teacher_lr = getattr(self.cfg, 'learning_rate_teacher', 1e-4) 
+        
+        # 建立一個臨時的 config 來傳遞學習率
+        teacher_cfg = types.SimpleNamespace(**self.cfg.__dict__)
+        teacher_cfg.learning_rate = teacher_lr
+        
+        # 使用您提供的 optimizer 函數，但只作用在 teacher 模型上
+        optimizer_teacher, scheduler_teacher = whisper_flamingo_optimizer(
+            self.teacher, teacher_cfg, self.t_total
+        )
+
+        # --- 優化器 2: Student's Optimizer ---
+        # 使用標準的 whisper_optimizer，訓練 Student 的 Decoder
+        print("Setting up Student's optimizer...")
+        student_lr = getattr(self.cfg, 'learning_rate_student', 1e-4)
+        
+        student_cfg = types.SimpleNamespace(**self.cfg.__dict__)
+        student_cfg.learning_rate = student_lr
+        
+        optimizer_student, scheduler_student = whisper_optimizer(
+            self.student, student_cfg, self.t_total
+        )
+
+        # 按照 PyTorch Lightning 的規定，回傳兩個 list
+        return [optimizer_teacher, optimizer_student], [scheduler_teacher, scheduler_student]
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
@@ -309,8 +387,7 @@ class DistillWhisperModule(LightningModule):
                                       self.model_name,
                                       max_length=self.cfg.audio_max_length,
                                       spec_augment=self.cfg.spec_augment,
-                                      noise_prob=cfg.noise_prob,
-                                      lang=cfg.lang,
+                                      noise_prob=cfg.noise_prob
                                       )
         batch_sampler = SortedBatchSampler(
                     batch_size = self.cfg.batch_size,
@@ -333,8 +410,7 @@ class DistillWhisperModule(LightningModule):
                                     self.model_name,
                                     max_length=self.cfg.audio_max_length,
                                     spec_augment=False,
-                                    noise_prob=0,
-                                    lang=cfg.lang,
+                                    noise_prob=0
                                     )
         batch_sampler = SortedBatchSampler(
                     batch_size = self.cfg.batch_size,
@@ -354,8 +430,7 @@ class DistillWhisperModule(LightningModule):
                                     self.model_name,
                                     max_length=self.cfg.audio_max_length,
                                     spec_augment=False,
-                                    noise_prob=0,
-                                    lang=cfg.lang,
+                                    noise_prob=0
                                     )
         batch_sampler = SortedBatchSampler(
                     batch_size = self.cfg.batch_size,

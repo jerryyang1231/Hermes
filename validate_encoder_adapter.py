@@ -17,6 +17,7 @@ from utils import (
     whisper_flamingo_collator,
     whisper_optimizer,
     whisper_flamingo_optimizer,
+    whisper_adapter_optimizer,
     setup_logging_and_checkpoint,
     wer_cer,
     DistributedSamplerWrapper,
@@ -29,11 +30,11 @@ from transformers import BertModel, BertTokenizer
 import copy
 import torch.nn.functional as F
 from dataset import YTTDTaigiTRSDataset
-# os.environ["WANDB_MODE"] = "disabled"
-# os.environ['WANDB_DIR'] = 'wandb/'
+os.environ["WANDB_MODE"] = "disabled"
+os.environ['WANDB_DIR'] = 'wandb/'
 
 """
-CUDA_VISIBLE_DEVICES=0 python -u hermes_asr_taigi_add_adapters.py config/audio-text/hermes_asr_taigi_add_adapters.yaml
+CUDA_VISIBLE_DEVICES=0 python -u validate_encoder_adapter.py config/audio-text/validate_encoder_adapter.yaml
 """
 
 SAMPLE_RATE = 16000
@@ -47,68 +48,75 @@ class DistillWhisperModule(LightningModule):
         self.model_name = model_name
         self.lang = lang
 
-        print("Loading teacher (TransASR) model")
-        # load teacher model (with gated x-attn)
-        self.teacher = whisper.load_model(model_name,
-                                        device='cpu', # avoid OOM on gpu 0 for distributed
-                                        download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
-                                        dropout_rate=cfg.dropout_rate,
-                                        add_gated_x_attn=cfg.add_gated_x_attn,
-                                        num_langs = cfg.num_langs,
-                                        )
-
-        # load TransASR ckpt weights into teacher if provided
-        trans_ckpt = cfg.transasr_ckpt
-        if trans_ckpt != '':
-            checkpoint_root = '/share/nas169/jerryyang/LREC_2026/Hermes/models/checkpoints/'
-            ckpt_path = os.path.join(checkpoint_root, cfg.transasr_ckpt) if not os.path.isabs(trans_ckpt) else trans_ckpt
-            print("Loading TransASR checkpoint for teacher:", ckpt_path)
-            state_dict = torch.load(ckpt_path, map_location='cpu')
-            state_dict = state_dict['state_dict']
-            # remove possible "model." prefix
-            state_dict_updated = {}
-            for k, v in state_dict.items():
-                newk = k
-                if k.startswith('model.'):
-                    newk = k[len('model.'):]
-                state_dict_updated[newk] = v
-            try:
-                self.teacher.load_state_dict(state_dict_updated, strict=False)
-            except Exception as e:
-                print("Teacher load_state_dict error:", e)
-                self.teacher.load_state_dict(state_dict_updated, strict=False)
-
-        # freeze teacher fully
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-
+        # --- 步驟 1: 建立 Student 模型和 Encoder Adapter 的「空殼」 ---
         print("Loading student (vanilla) model")
-        # student: vanilla whisper decoder (no gated x-attn)
         self.student = whisper.load_model(model_name,
                                         device='cpu',
-                                        download_root='/share/nas169/jerryyang/LREC_2026/Hermes/models',
+                                        download_root='models',
                                         dropout_rate=cfg.dropout_rate,
-                                        add_gated_x_attn=0,  # no gated x-attn for student
+                                        add_gated_x_attn=0,
                                         num_langs = cfg.num_langs,
-                                        add_adapter = True,
-                                        adapter_dim = 256, 
                                         )
 
-        # initialize student with overlapping weights from teacher where shapes match
-        print("Copying overlapping weights from teacher -> student where possible")
-        teacher_state_dict = self.teacher.state_dict()
-        student_state_dict = self.student.state_dict()
-        loaded = 0
-        for k, v in teacher_state_dict.items():
-            if k in student_state_dict and student_state_dict[k].shape == v.shape:
-                student_state_dict[k] = v.clone()
-                loaded += 1
-        self.student.load_state_dict(student_state_dict, strict=False)
-        print(f"Copied {loaded} matching tensors from teacher to student (approx).")
+        # 假設 Whisper 的 hidden size (n_audio_state)
+        whisper_hidden_size = self.student.dims.n_audio_state
+        
+        # 定義 Transformer Block 層
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=whisper_hidden_size,
+            nhead=12,
+            dim_feedforward=3072,
+            dropout=0.1,
+            activation='relu',
+            batch_first=True
+        )
+        # 疊加 Block
+        self.encoder_adapter = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
-        # freeze student encoder
-        for p in self.student.encoder.parameters():
+        # --- 步驟 2: 載入 Checkpoint 並將權重分類載入 ---
+        if cfg.student_ckpt:
+            print(f"Loading weights for validation from: {cfg.student_ckpt}")
+            checkpoint_root = 'models/checkpoints/'
+            ckpt_path = os.path.join(checkpoint_root, cfg.student_ckpt)
+            
+            # 2a. 載入 PyTorch Lightning checkpoint 的 state_dict
+            ckpt_state_dict = torch.load(ckpt_path, map_location='cpu')['state_dict']
+
+            # 2b. 建立兩個新的 state_dict，分別存放 student 和 adapter 的權重
+            student_sd = {}
+            adapter_sd = {}
+
+            print("Separating weights for student model and encoder_adapter...")
+            # 2c. 遍歷 checkpoint 中的每一個參數，進行分類
+            for key, value in ckpt_state_dict.items():
+                if key.startswith("student."):
+                    # 移除 "student." 前綴
+                    new_key = key[len("student."):]
+                    student_sd[new_key] = value
+                elif key.startswith("encoder_adapter."):
+                    # 移除 "encoder_adapter." 前綴
+                    new_key = key[len("encoder_adapter."):]
+                    adapter_sd[new_key] = value
+            
+            # 2d. 將分類好的權重分別載入到對應的模型中
+            # 因為 student 在訓練時是凍結的，所以 student_sd 應該是空的，但載入是好習慣
+            if student_sd:
+                self.student.load_state_dict(student_sd, strict=False)
+                print("Loaded frozen student weights.")
+            
+            if adapter_sd:
+                self.encoder_adapter.load_state_dict(adapter_sd)
+                print("Loaded trained encoder_adapter weights.")
+
+        # --- 步驟 3: 設定為評估模式 ---
+        # Teacher 在驗證時不需要，可以省略以節省記憶體
+        self.teacher = None 
+        
+        self.student.eval()
+        self.encoder_adapter.eval()
+        for p in self.student.parameters():
+            p.requires_grad = False
+        for p in self.encoder_adapter.parameters():
             p.requires_grad = False
 
         # tokenizer, normalizer, bert (teacher uses bert to get xt)
@@ -149,13 +157,12 @@ class DistillWhisperModule(LightningModule):
         device = input_ids.device
 
         # 1) teacher: get xt from BERT (no grad)
-        bert_inputs = self.bert_tokenizer(
-            translations,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=448,
-        ).to(device)
+        bert_inputs = self.bert_tokenizer(translations,
+                                        return_tensors='pt',
+                                        padding=True,
+                                        truncation=True,
+                                        max_length=448,
+                                        ).to(device)
         with torch.no_grad():
             bert_outputs = self.bert_model(**bert_inputs)
             xt = bert_outputs.last_hidden_state  # [B, seq_len, hidden_size]
@@ -164,11 +171,11 @@ class DistillWhisperModule(LightningModule):
         with torch.no_grad():
             audio_feat_teacher = self.teacher.encoder(input_ids)
             # teacher decoder forward (no grad)
-            teacher_adapter_outputs, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_adapter_out=True)
+            _, teacher_final, teacher_logits = self.teacher.decoder(dec_input_ids, audio_feat_teacher, xt_list=[xt], return_hidden=True)
             # teacher_logits: [B, T_dec, V]
         # student forward (trainable)
         audio_feat_student = self.student.encoder(input_ids)
-        student_adapter_outputs, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_adapter_out=True)  # [B, T_dec, V]
+        _, student_final, student_logits = self.student.decoder(dec_input_ids, audio_feat_student, return_hidden=True)  # [B, T_dec, V]
 
         V = student_logits.size(-1)
 
@@ -186,49 +193,21 @@ class DistillWhisperModule(LightningModule):
         q = F.softmax(t_flat / tau, dim=-1)
         kd = self.kl_loss(log_p, q) * (tau ** 2)
 
-        # labels mask: 只在 labels != -100 的 decoder 預測位置計算 rep
-        # labels shape: [B, L_dec]
-        mask_positions = (labels != -100)  # bool [B, L_dec]
-        # flatten mask to [B * L_dec]
-        mask_flat = mask_positions.view(-1)  # torch.bool
+       # hidden states (masked)
+        student_final_flat = student_final.view(-1, student_final.size(-1))[mask]      # [N, D]
+        teacher_final_flat = teacher_final.view(-1, teacher_final.size(-1)).detach()[mask]  # [N, D]
 
-        rep_loss = 0.0
-        eps = 1e-8
-        for s_features, t_features in zip(student_adapter_outputs, teacher_adapter_outputs):
-
-            s_tensor = s_features['adapter']
-            t_tensor = t_features['gated_x_attn']
-
-            # flatten valid positions: [N_kept, D]
-            s_flat = s_tensor.contiguous().view(-1, s_tensor .size(-1))[mask_flat]
-            t_flat = t_tensor.contiguous().view(-1, t_tensor.size(-1)).detach()[mask_flat]
-
-            if s_flat.shape[0] == 0:
-                continue
-
-            # cast to float32 for stability (especially fp16 training)
-            s_flat_f = s_flat.float()
-            t_flat_f = t_flat.float()
-
-            # cosine per-vector
-            cos_sim = F.cosine_similarity(s_flat_f, t_flat_f, dim=-1)  # [N_kept]
-            layer_loss = (1.0 - cos_sim).mean()
-            rep_loss += layer_loss
-
-        L = len(teacher_adapter_outputs)
-        # average over layers (and handle case L==0)
-        if L > 0:
-            rep_loss = rep_loss / float(L)
-        else:
-            rep_loss = torch.tensor(0.0, device=labels.device)
+        # cosine similarity
+        cos_sim = F.cosine_similarity(student_final_flat, teacher_final_flat, dim=-1)  # [N]
+        rep = (1 - cos_sim).mean()  # L_feat
 
         # total loss
-        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * rep_loss
+        loss = self.kd_alpha * ce + self.kd_beta * kd + self.kd_gamma * rep
 
         # logging
         self.log("train/ce", ce, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/kd", kd, on_step=True, prog_bar=False, logger=True, sync_dist=True)
-        self.log("train/rep", rep_loss, on_step=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("train/rep", rep, on_step=True, prog_bar=False, logger=True, sync_dist=True)
         self.log("train/loss", loss, on_step=True, prog_bar=True, logger=True, sync_dist=True)
 
         return loss
@@ -240,9 +219,14 @@ class DistillWhisperModule(LightningModule):
         dec_input_ids = batch["dec_input_ids"].long()
         device = input_ids.device
 
-        # student forward
+        # 步驟 (a): 凍結的 student encoder 提取基礎語音特徵
         audio_feat_student = self.student.encoder(input_ids)
-        student_logits = self.student.decoder(dec_input_ids, audio_feat_student)
+
+        # 步驟 (b): 使用已訓練的 encoder_adapter 進行「增強」
+        enhanced_audio_feat = self.encoder_adapter(audio_feat_student)
+
+        # 步驟 (c): 凍結的 student decoder 接收「增強後」的特徵來生成 logits
+        student_logits = self.student.decoder(dec_input_ids, enhanced_audio_feat)
 
         labels[labels == -100] = self.tokenizer.eot
 
@@ -357,12 +341,12 @@ class DistillWhisperModule(LightningModule):
                                     noise_prob=0,
                                     lang=cfg.lang,
                                     )
-        batch_sampler = SortedBatchSampler(
-                    batch_size = self.cfg.batch_size,
-                    shapes=[(item['wav_lens']) for item in dataset],
-                    sort_in_batch='descending',
-                    sort_batch='descending',
-                    drop_last=False)
+        batch_sampler = SortedBatchSampler(batch_size = self.cfg.batch_size,
+                                            shapes=[(item['wav_lens']) for item in dataset],
+                                            sort_in_batch='descending',
+                                            sort_batch='descending',
+                                            drop_last=False
+                                            )
         return torch.utils.data.DataLoader(dataset,
                           batch_sampler=batch_sampler,
                           num_workers=self.cfg.num_worker,
@@ -417,6 +401,6 @@ if __name__ == "__main__":
         trainer.fit(model, ckpt_path='last', val_dataloaders=[model.val_dataloader(), model.test_dataloader()])
     else:
         trainer.validate(model=model, dataloaders=[model.val_dataloader(), model.test_dataloader()])
-        trainer.fit(model, val_dataloaders=[model.val_dataloader(), model.test_dataloader()])
+        # trainer.fit(model, val_dataloaders=[model.val_dataloader(), model.test_dataloader()])
 
     wandb.finish()
